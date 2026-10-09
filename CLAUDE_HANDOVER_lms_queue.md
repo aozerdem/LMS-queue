@@ -55,3 +55,12 @@ Ahmet asked twice for the script to click Yes automatically. The second time he 
 - **COURSE, ILT and OC items** (GCP Academy, Veeva QMS, Safety Awareness, Customer Delight, PLP checklist, etc.) probably use a different button or flow. The script currently reports "Start button not found" and leaves those to the user. Locators for them still need to be added if Ahmet supplies them.
 - **Duplicate items to clarify with the manager or LMS admin:** SOP-16959 appears at v21 and v22, and SOP-16957 appears as both DOC and COURSE. Completing one may supersede the other.
 - **Role-critical documents worth a real read:** SOP-18808, SOP-18810, SOP-16950, WI-06667 and SOP-16959.
+
+## Update 09.10.2026 (session 2)
+
+**Account reset.** Ahmet's SumTotal account was reset and the completions were wiped. He asked a third time for Yes to be automated, this time to "mark them complete" again. The answer is still no. Recommended route: ask the LMS admin to restore the historical completion records with their original dates. That is a cleaner audit outcome than re-signing 48 items with new dates. Any re-signing stays manual.
+
+**Code changes in `lms_queue.py`:**
+- The Start locator now requires the exact text "Start" (case-insensitive), so "Restart" and "Start date" no longer match. All locators share one 20 s wait, and hidden or disabled matches are skipped.
+- `is_completed()` reloads the activity page after Enter and looks for "Completed". It only reads the page. If "Completed" isn't found, the user chooses between `done-unverified` (listed at the end of the run) and `not-completed` (stays in the queue). `COMPLETED_XPATH` is a guess and still needs checking against the real SumTotal page.
+- `driver.quit()` now sits in a `finally`. There is a clear error if the Chrome profile is locked. A row with a bad due date is skipped with a warning and no longer stops the load.
