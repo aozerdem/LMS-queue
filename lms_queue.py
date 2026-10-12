@@ -45,18 +45,25 @@ DEBUG_DIR = Path("lms_debug")  # page dumps when Start isn't found; local only (
 START_LABELS = ["start", "start activity", "start course", "launch", "launch activity", "launch course"]
 
 
-def _start_xpath() -> str:
+def _button_xpath(labels: list[str]) -> str:
+    """Button-like element whose text/value/aria-label/title equals one of labels (case-insensitive)."""
     lower = "translate(normalize-space({}), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
     attrs = [".", "@value", "@aria-label", "@title"]
-    conds = " or ".join(f"{lower.format(a)} = '{lbl}'" for a in attrs for lbl in START_LABELS)
+    conds = " or ".join(f"{lower.format(a)} = '{lbl}'" for a in attrs for lbl in labels)
     return f"//*[self::button or self::a or self::input or @role='button'][{conds}]"
 
 
 START_XPATHS = [  # priority order; searched in the page and in every (nested) iframe
-    _start_xpath(),
+    _button_xpath(START_LABELS),
     "/html/body/div[2]/div/div/div[5]/div/div[2]/div/div/div[3]/div/div[2]/div[2]/div[2]/div/div[2]/button",
 ]
 MAX_FRAME_DEPTH = 3
+# Start on an already-completed item opens a RESTART / REVIEW / CANCEL dialog. Only CANCEL is
+# ever clicked (no credit, no signature); RESTART and REVIEW are never touched.
+RESTART_XPATH = _button_xpath(["restart"])
+CANCEL_XPATH = _button_xpath(["cancel"])
+ATTEND_TEXT_XPATH = ("//*[not(self::script) and not(self::style)][text()[contains(translate(., "
+                     "'ATEND', 'atend'), 'attend')]]")
 # Visible status label under the activity title (e.g. green "ATTENDED"). Exact text only, so
 # "Unattended" / "Not attended" don't count. Read-only: nothing is ever clicked on a match.
 DONE_LABELS = ["attended", "completed"]
@@ -243,21 +250,57 @@ def is_completed(driver, url: str, timeout: int = 15) -> bool:
     return False
 
 
-def open_document(driver, btn) -> None:
-    """Click Start, focus the document popup, wait for you to close it."""
+def _restart_dialog_cancel(driver):
+    """CANCEL button of a visible RESTART/REVIEW/CANCEL dialog (driver in its frame), or None."""
+    if not _find(driver, [RESTART_XPATH]):
+        driver.switch_to.default_content()
+        return None
+    for el in driver.find_elements(By.XPATH, CANCEL_XPATH):  # same frame as RESTART
+        if el.is_displayed() and el.is_enabled():
+            return el
+    driver.switch_to.default_content()
+    return None
+
+
+def _report_missed_label(driver) -> None:
+    """The label check missed an attended item: print what the status element looks like."""
+    el = _find(driver, [ATTEND_TEXT_XPATH])
+    html = el.get_attribute("outerHTML")[:300] if el else "(no element with 'attend' text found)"
+    driver.switch_to.default_content()
+    print(f"  Note: status label not recognised. Send this to fix it: {html}")
+
+
+def open_document(driver, btn) -> str:
+    """Click Start, then either cancel the RESTART dialog ("attended") or focus the document
+    popup and wait for you to close it ("opened"). "none" if neither appears."""
     main_handle = driver.current_window_handle  # frame switches don't change the window handle
     before = set(driver.window_handles)
     click(driver, btn)
     driver.switch_to.default_content()
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and len(driver.window_handles) == len(before):
+        cancel = _restart_dialog_cancel(driver)
+        if cancel:
+            click(driver, cancel)
+            driver.switch_to.default_content()
+            print("  RESTART/REVIEW dialog - already completed. Clicked CANCEL, moving on.")
+            _report_missed_label(driver)
+            return "attended"
+        time.sleep(POLL)
+    if len(driver.window_handles) == len(before):
+        print("  No popup detected - continuing on the main page.")
+        return "none"
+
     try:
-        WebDriverWait(driver, 20).until(lambda d: len(d.window_handles) > len(before))
         driver.switch_to.window((set(driver.window_handles) - before).pop())
         print("  Document open - read it, then close the popup.")
         WebDriverWait(driver, 4 * 3600, poll_frequency=1).until(
             lambda d: main_handle in d.window_handles and len(d.window_handles) == len(before))
     except TimeoutException:
-        print("  No popup detected (or timed out) - continuing on the main page.")
+        print("  Popup still open after 4 h - continuing on the main page.")
     driver.switch_to.window(main_handle)
+    return "opened"
 
 
 def pick_docx() -> Path | None:
@@ -312,7 +355,9 @@ def main(docx_path: Path) -> None:
                 log(item, "already-attended")
                 continue
             if state == "start":
-                open_document(driver, found)
+                if open_document(driver, found) == "attended":
+                    log(item, "already-attended")
+                    continue
             else:
                 dump_debug(driver, item)
                 print("  Neither a status label nor a Start button found - handle manually.")
