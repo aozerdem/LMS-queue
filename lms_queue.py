@@ -23,7 +23,14 @@ from pathlib import Path
 from docx import Document
 from docx.oxml.ns import qn
 from selenium import webdriver
-from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    NoSuchFrameException,
+    SessionNotCreatedException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -31,13 +38,32 @@ from selenium.webdriver.support.ui import WebDriverWait
 PROFILE_DIR = Path.home() / ".lms_selenium_profile"  # keeps SSO session between runs
 LOG_FILE = Path("lms_progress.csv")
 DATE_FMT = "%d %b %y"
-START_XPATHS = [  # priority order; exact text so "Restart" / "Start date" don't match
-    "//button[translate(normalize-space(.), 'START', 'start') = 'start']",
+DEBUG_DIR = Path("lms_debug")  # page dumps when Start isn't found; local only (gitignored)
+
+# Exact labels only (case-insensitive), so "Restart", "Start date" - and any Yes /
+# completion / attestation control - can never match.
+START_LABELS = ["start", "start activity", "start course", "launch", "launch activity", "launch course"]
+
+
+def _start_xpath() -> str:
+    lower = "translate(normalize-space({}), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    attrs = [".", "@value", "@aria-label", "@title"]
+    conds = " or ".join(f"{lower.format(a)} = '{lbl}'" for a in attrs for lbl in START_LABELS)
+    return f"//*[self::button or self::a or self::input or @role='button'][{conds}]"
+
+
+START_XPATHS = [  # priority order; searched in the page and in every (nested) iframe
+    _start_xpath(),
     "/html/body/div[2]/div/div/div[5]/div/div[2]/div/div/div[3]/div/div[2]/div[2]/div[2]/div/div[2]/button",
 ]
+MAX_FRAME_DEPTH = 3
 # Read-only check of the activity page after you confirm. Adjust to SumTotal's actual status text.
 COMPLETED_XPATH = "//*[not(self::script)][translate(normalize-space(text()), 'COMPLETED', 'completed') = 'completed']"
-DONE_STATUSES = {"done", "done-unverified"}
+# SumTotal puts the activity status in an inline <script> (page-state JSON), e.g. ..."Attended"...
+# Matched only as a quoted value after a colon, so keys like "isAttended": false or text like
+# "Unattended" don't count. Tighten this once the real snippet is known.
+STATUS_PATTERN = re.compile(r"""[:=]\s*["'](attended|completed)["']""", re.IGNORECASE)
+DONE_STATUSES = {"done", "done-unverified", "already-attended"}
 
 
 @dataclass
@@ -103,25 +129,95 @@ def log(item: Item, status: str) -> None:
                     item.title, item.due.date(), status])
 
 
-def _first_clickable(driver):
+def _search_frames(driver, depth: int = 0):
+    """Depth-first search of the current frame and its child frames.
+
+    On success the driver is left switched into the frame that holds the button.
+    """
     for xp in START_XPATHS:
         for el in driver.find_elements(By.XPATH, xp):
             if el.is_displayed() and el.is_enabled():
                 return el
-    return False
+    if depth < MAX_FRAME_DEPTH:
+        for frame in driver.find_elements(By.CSS_SELECTOR, "iframe, frame"):
+            driver.switch_to.frame(frame)
+            el = _search_frames(driver, depth + 1)
+            if el:
+                return el
+            driver.switch_to.parent_frame()
+    return None
+
+
+def _first_clickable(driver):
+    driver.switch_to.default_content()
+    try:
+        return _search_frames(driver) or False
+    except (StaleElementReferenceException, NoSuchFrameException):
+        return False  # page still re-rendering; poll again
 
 
 def find_start(driver, timeout: int = 20):
-    """Return the Start button (locators tried in priority order), or None. One shared wait."""
+    """Return the Start button (driver switched into its frame), or None. One shared wait."""
     try:
         return WebDriverWait(driver, timeout).until(_first_clickable)
     except TimeoutException:
+        driver.switch_to.default_content()
         return None
 
 
+def click(driver, el) -> None:
+    """Normal click; JS click if an overlay/spinner intercepts it."""
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+    try:
+        el.click()
+    except (ElementClickInterceptedException, ElementNotInteractableException):
+        driver.execute_script("arguments[0].click();", el)
+
+
+def dump_debug(driver, item: Item) -> None:
+    """Save a screenshot and every frame's HTML, and list clickable-looking elements."""
+    DEBUG_DIR.mkdir(exist_ok=True)
+    stem = DEBUG_DIR / (item.activity_id or "unknown")
+    driver.switch_to.default_content()
+    driver.save_screenshot(f"{stem}.png")
+    print(f"  Debug: screenshot + page HTML saved under {DEBUG_DIR}/ - send me the button list below.")
+
+    def walk(path: str, depth: int) -> None:
+        Path(f"{stem}_frame{path or '-top'}.html").write_text(driver.page_source, encoding="utf-8")
+        els = driver.find_elements(By.CSS_SELECTOR, "button, a, input[type=button], input[type=submit], [role=button]")
+        shown = [e for e in els if e.is_displayed()]
+        print(f"  frame {path or 'top'}: {len(shown)} visible clickable elements")
+        for e in shown[:25]:
+            label = (e.text or e.get_attribute("value") or e.get_attribute("aria-label")
+                     or e.get_attribute("title") or "").strip().replace("\n", " ")[:50]
+            print(f"    <{e.tag_name}> {label!r} id={e.get_attribute('id')!r} class={(e.get_attribute('class') or '')[:60]!r}")
+        if depth < MAX_FRAME_DEPTH:
+            for i, frame in enumerate(driver.find_elements(By.CSS_SELECTOR, "iframe, frame")):
+                driver.switch_to.frame(frame)
+                walk(f"{path}-{i}", depth + 1)
+                driver.switch_to.parent_frame()
+
+    try:
+        walk("", 0)
+    except Exception as e:  # diagnostics must never kill the run
+        print(f"  Debug dump incomplete: {e!r}")
+    driver.switch_to.default_content()
+
+
+def status_match(driver) -> str | None:
+    """Return a snippet around an Attended/Completed status in the page's scripts, or None."""
+    src = driver.page_source
+    m = STATUS_PATTERN.search(src)
+    if not m:
+        return None
+    return " ".join(src[max(0, m.start() - 60):m.end() + 20].split())
+
+
 def is_completed(driver, url: str, timeout: int = 10) -> bool:
-    """Reload the activity page and look for a Completed status. Read-only."""
+    """Reload the activity page and look for an Attended/Completed status. Read-only."""
     driver.get(url)
+    if status_match(driver):
+        return True
     try:
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.XPATH, COMPLETED_XPATH)))
@@ -130,14 +226,16 @@ def is_completed(driver, url: str, timeout: int = 10) -> bool:
         return False
 
 
-def open_document(driver) -> bool:
+def open_document(driver, item: Item) -> bool:
     """Click Start, focus the document popup, wait for you to close it."""
     main_handle = driver.current_window_handle
     before = set(driver.window_handles)
     btn = find_start(driver)
     if btn is None:
+        dump_debug(driver, item)
         return False
-    btn.click()
+    click(driver, btn)
+    driver.switch_to.default_content()
     try:
         WebDriverWait(driver, 20).until(lambda d: len(d.window_handles) > len(before))
         driver.switch_to.window((set(driver.window_handles) - before).pop())
@@ -196,7 +294,12 @@ def main(docx_path: Path) -> None:
         for n, item in enumerate(queue, 1):
             driver.get(item.url)
             print(f"[{n}/{len(queue)}] due {item.due:%d %b} | {item.title}")
-            if not open_document(driver):
+            snippet = status_match(driver)
+            if snippet:
+                print(f"  Already attended/completed - skipping. Matched: ...{snippet}...")
+                log(item, "already-attended")
+                continue
+            if not open_document(driver, item):
                 print("  Start button not found (course/ILT or already started?) - handle manually.")
             ans = input("  Answer the read confirmation in the browser, then Enter = done | s = skip | q = quit: ").strip().lower()
             if ans == "q":
