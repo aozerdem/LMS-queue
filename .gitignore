@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 lms_progress.csv
 *.docx
+lms_debug/
