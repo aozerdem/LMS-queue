@@ -7,7 +7,8 @@ the script handles navigation, ordering and progress tracking (resumable).
 
 Usage:
     pip install selenium python-docx
-    python lms_queue.py POL.docx
+    python lms_queue.py            # pick the .docx in a file dialog
+    python lms_queue.py POL.docx   # or pass it directly
 """
 from __future__ import annotations
 
@@ -149,8 +150,29 @@ def open_document(driver) -> bool:
     return True
 
 
-def main(docx_path: str) -> None:
-    items = load_items(Path(docx_path))
+def pick_docx() -> Path | None:
+    """Ask for the assignments .docx in a native file dialog. None if cancelled."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)  # otherwise the dialog can open behind the console
+    path = filedialog.askopenfilename(
+        parent=root,
+        title="Select the LMS assignments .docx (table with links and due dates)",
+        filetypes=[("Word documents", "*.docx"), ("All files", "*.*")],
+    )
+    root.destroy()
+    return Path(path) if path else None
+
+
+def main(docx_path: Path) -> None:
+    if not docx_path.is_file():
+        sys.exit(f"File not found: {docx_path.resolve()}")
+    items = load_items(docx_path)
+    if not items:
+        sys.exit(f"No linked assignments found in {docx_path.name} - is it the exported table?")
     done = load_done()
     queue = [i for i in items if i.activity_id not in done]
     print(f"{len(items)} assignments, {len(done)} done, {len(queue)} remaining.\n")
@@ -201,4 +223,7 @@ def main(docx_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "POL.docx")
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else pick_docx()
+    if path is None:
+        sys.exit("No file selected.")
+    main(path)
