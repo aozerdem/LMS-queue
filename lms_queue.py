@@ -16,6 +16,7 @@ import base64
 import csv
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,6 @@ from selenium.common.exceptions import (
     TimeoutException,
 )
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 PROFILE_DIR = Path.home() / ".lms_selenium_profile"  # keeps SSO session between runs
@@ -45,24 +45,37 @@ DEBUG_DIR = Path("lms_debug")  # page dumps when Start isn't found; local only (
 START_LABELS = ["start", "start activity", "start course", "launch", "launch activity", "launch course"]
 
 
-def _start_xpath() -> str:
+def _button_xpath(labels: list[str]) -> str:
+    """Button-like element whose text/value/aria-label/title equals one of labels (case-insensitive)."""
     lower = "translate(normalize-space({}), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
     attrs = [".", "@value", "@aria-label", "@title"]
-    conds = " or ".join(f"{lower.format(a)} = '{lbl}'" for a in attrs for lbl in START_LABELS)
+    conds = " or ".join(f"{lower.format(a)} = '{lbl}'" for a in attrs for lbl in labels)
     return f"//*[self::button or self::a or self::input or @role='button'][{conds}]"
 
 
 START_XPATHS = [  # priority order; searched in the page and in every (nested) iframe
-    _start_xpath(),
+    _button_xpath(START_LABELS),
     "/html/body/div[2]/div/div/div[5]/div/div[2]/div/div/div[3]/div/div[2]/div[2]/div[2]/div/div[2]/button",
 ]
 MAX_FRAME_DEPTH = 3
-# Read-only check of the activity page after you confirm. Adjust to SumTotal's actual status text.
-COMPLETED_XPATH = "//*[not(self::script)][translate(normalize-space(text()), 'COMPLETED', 'completed') = 'completed']"
-# SumTotal puts the activity status in an inline <script> (page-state JSON), e.g. ..."Attended"...
-# Matched only as a quoted value after a colon, so keys like "isAttended": false or text like
-# "Unattended" don't count. Tighten this once the real snippet is known.
-STATUS_PATTERN = re.compile(r"""[:=]\s*["'](attended|completed)["']""", re.IGNORECASE)
+# Start on an already-completed item opens a RESTART / REVIEW / CANCEL dialog. Only CANCEL is
+# ever clicked (no credit, no signature); RESTART and REVIEW are never touched.
+RESTART_XPATH = _button_xpath(["restart"])
+CANCEL_XPATH = _button_xpath(["cancel"])
+ATTEND_TEXT_XPATH = ("//*[not(self::script) and not(self::style)][text()[contains(translate(., "
+                     "'ATEND', 'atend'), 'attend')]]")
+# Visible status label under the activity title (e.g. green "ATTENDED"). Exact text only, so
+# "Unattended" / "Not attended" don't count. Read-only: nothing is ever clicked on a match.
+DONE_LABELS = ["attended", "completed"]
+STATUS_XPATH = (
+    "//*[not(self::script) and not(self::style)][text()["
+    + " or ".join("translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                  f"'abcdefghijklmnopqrstuvwxyz') = '{lbl}'" for lbl in DONE_LABELS)
+    + "]]"
+)
+STATUS_GRACE = 1.0  # s to keep looking for the status label after Start has rendered;
+# raise it if an attended item ever gets its Start clicked (label rendering later than that)
+POLL = 0.2  # s between page checks
 DONE_STATUSES = {"done", "done-unverified", "already-attended"}
 
 
@@ -129,40 +142,60 @@ def log(item: Item, status: str) -> None:
                     item.title, item.due.date(), status])
 
 
-def _search_frames(driver, depth: int = 0):
-    """Depth-first search of the current frame and its child frames.
+def _search_frames(driver, xpaths: list[str], depth: int = 0):
+    """Depth-first search of the current frame and its child frames for a visible match.
 
-    On success the driver is left switched into the frame that holds the button.
+    On success the driver is left switched into the frame that holds the element.
     """
-    for xp in START_XPATHS:
+    for xp in xpaths:
         for el in driver.find_elements(By.XPATH, xp):
             if el.is_displayed() and el.is_enabled():
                 return el
     if depth < MAX_FRAME_DEPTH:
         for frame in driver.find_elements(By.CSS_SELECTOR, "iframe, frame"):
             driver.switch_to.frame(frame)
-            el = _search_frames(driver, depth + 1)
+            el = _search_frames(driver, xpaths, depth + 1)
             if el:
                 return el
             driver.switch_to.parent_frame()
     return None
 
 
-def _first_clickable(driver):
+def _find(driver, xpaths: list[str]):
     driver.switch_to.default_content()
     try:
-        return _search_frames(driver) or False
+        return _search_frames(driver, xpaths)
     except (StaleElementReferenceException, NoSuchFrameException):
-        return False  # page still re-rendering; poll again
+        return None  # page still re-rendering; poll again
 
 
-def find_start(driver, timeout: int = 20):
-    """Return the Start button (driver switched into its frame), or None. One shared wait."""
-    try:
-        return WebDriverWait(driver, timeout).until(_first_clickable)
-    except TimeoutException:
-        driver.switch_to.default_content()
-        return None
+def check_page(driver, timeout: int = 20):
+    """Wait for the activity page to render and classify it. Read-only.
+
+    Returns ("done", label_text), ("start", button) with the driver in the button's frame,
+    or (None, None). Attended items still show Start (relaunch), and the status label can
+    render after it - so once Start appears, keep looking for the label for STATUS_GRACE s.
+    """
+    deadline = time.monotonic() + timeout
+    start_seen_at = None
+    while time.monotonic() < deadline:
+        label = _find(driver, [STATUS_XPATH])
+        if label:
+            text = label.text.strip() or "attended"
+            driver.switch_to.default_content()
+            if start_seen_at is not None:  # tells you how low STATUS_GRACE can safely go
+                text += f" (label {time.monotonic() - start_seen_at:.1f}s after Start)"
+            return "done", text
+        if start_seen_at is None and _find(driver, START_XPATHS):
+            start_seen_at = time.monotonic()
+        if start_seen_at is not None and time.monotonic() - start_seen_at >= STATUS_GRACE:
+            btn = _find(driver, START_XPATHS)  # re-find: the page may have re-rendered
+            if btn:
+                return "start", btn
+            start_seen_at = None
+        time.sleep(POLL)
+    driver.switch_to.default_content()
+    return None, None
 
 
 def click(driver, el) -> None:
@@ -204,48 +237,70 @@ def dump_debug(driver, item: Item) -> None:
     driver.switch_to.default_content()
 
 
-def status_match(driver) -> str | None:
-    """Return a snippet around an Attended/Completed status in the page's scripts, or None."""
-    src = driver.page_source
-    m = STATUS_PATTERN.search(src)
-    if not m:
-        return None
-    return " ".join(src[max(0, m.start() - 60):m.end() + 20].split())
-
-
-def is_completed(driver, url: str, timeout: int = 10) -> bool:
-    """Reload the activity page and look for an Attended/Completed status. Read-only."""
+def is_completed(driver, url: str, timeout: int = 15) -> bool:
+    """Reload the activity page and look for the Attended/Completed label. Read-only."""
     driver.get(url)
-    if status_match(driver):
-        return True
-    try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.XPATH, COMPLETED_XPATH)))
-        return True
-    except TimeoutException:
-        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _find(driver, [STATUS_XPATH]):
+            driver.switch_to.default_content()
+            return True
+        time.sleep(POLL)
+    driver.switch_to.default_content()
+    return False
 
 
-def open_document(driver, item: Item) -> bool:
-    """Click Start, focus the document popup, wait for you to close it."""
-    main_handle = driver.current_window_handle
+def _restart_dialog_cancel(driver):
+    """CANCEL button of a visible RESTART/REVIEW/CANCEL dialog (driver in its frame), or None."""
+    if not _find(driver, [RESTART_XPATH]):
+        driver.switch_to.default_content()
+        return None
+    for el in driver.find_elements(By.XPATH, CANCEL_XPATH):  # same frame as RESTART
+        if el.is_displayed() and el.is_enabled():
+            return el
+    driver.switch_to.default_content()
+    return None
+
+
+def _report_missed_label(driver) -> None:
+    """The label check missed an attended item: print what the status element looks like."""
+    el = _find(driver, [ATTEND_TEXT_XPATH])
+    html = el.get_attribute("outerHTML")[:300] if el else "(no element with 'attend' text found)"
+    driver.switch_to.default_content()
+    print(f"  Note: status label not recognised. Send this to fix it: {html}")
+
+
+def open_document(driver, btn) -> str:
+    """Click Start, then either cancel the RESTART dialog ("attended") or focus the document
+    popup and wait for you to close it ("opened"). "none" if neither appears."""
+    main_handle = driver.current_window_handle  # frame switches don't change the window handle
     before = set(driver.window_handles)
-    btn = find_start(driver)
-    if btn is None:
-        dump_debug(driver, item)
-        return False
     click(driver, btn)
     driver.switch_to.default_content()
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and len(driver.window_handles) == len(before):
+        cancel = _restart_dialog_cancel(driver)
+        if cancel:
+            click(driver, cancel)
+            driver.switch_to.default_content()
+            print("  RESTART/REVIEW dialog - already completed. Clicked CANCEL, moving on.")
+            _report_missed_label(driver)
+            return "attended"
+        time.sleep(POLL)
+    if len(driver.window_handles) == len(before):
+        print("  No popup detected - continuing on the main page.")
+        return "none"
+
     try:
-        WebDriverWait(driver, 20).until(lambda d: len(d.window_handles) > len(before))
         driver.switch_to.window((set(driver.window_handles) - before).pop())
         print("  Document open - read it, then close the popup.")
         WebDriverWait(driver, 4 * 3600, poll_frequency=1).until(
             lambda d: main_handle in d.window_handles and len(d.window_handles) == len(before))
     except TimeoutException:
-        print("  No popup detected (or timed out) - continuing on the main page.")
+        print("  Popup still open after 4 h - continuing on the main page.")
     driver.switch_to.window(main_handle)
-    return True
+    return "opened"
 
 
 def pick_docx() -> Path | None:
@@ -294,13 +349,18 @@ def main(docx_path: Path) -> None:
         for n, item in enumerate(queue, 1):
             driver.get(item.url)
             print(f"[{n}/{len(queue)}] due {item.due:%d %b} | {item.title}")
-            snippet = status_match(driver)
-            if snippet:
-                print(f"  Already attended/completed - skipping. Matched: ...{snippet}...")
+            state, found = check_page(driver)
+            if state == "done":
+                print(f"  Status '{found}' - already done, moving on.")
                 log(item, "already-attended")
                 continue
-            if not open_document(driver, item):
-                print("  Start button not found (course/ILT or already started?) - handle manually.")
+            if state == "start":
+                if open_document(driver, found) == "attended":
+                    log(item, "already-attended")
+                    continue
+            else:
+                dump_debug(driver, item)
+                print("  Neither a status label nor a Start button found - handle manually.")
             ans = input("  Answer the read confirmation in the browser, then Enter = done | s = skip | q = quit: ").strip().lower()
             if ans == "q":
                 break
