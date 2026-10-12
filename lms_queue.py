@@ -66,7 +66,9 @@ STATUS_XPATH = (
                   f"'abcdefghijklmnopqrstuvwxyz') = '{lbl}'" for lbl in DONE_LABELS)
     + "]]"
 )
-STATUS_GRACE = 3  # s to keep looking for the status label after Start has rendered
+STATUS_GRACE = 1.0  # s to keep looking for the status label after Start has rendered;
+# raise it if an attended item ever gets its Start clicked (label rendering later than that)
+POLL = 0.2  # s between page checks
 DONE_STATUSES = {"done", "done-unverified", "already-attended"}
 
 
@@ -174,6 +176,8 @@ def check_page(driver, timeout: int = 20):
         if label:
             text = label.text.strip() or "attended"
             driver.switch_to.default_content()
+            if start_seen_at is not None:  # tells you how low STATUS_GRACE can safely go
+                text += f" (label {time.monotonic() - start_seen_at:.1f}s after Start)"
             return "done", text
         if start_seen_at is None and _find(driver, START_XPATHS):
             start_seen_at = time.monotonic()
@@ -182,7 +186,7 @@ def check_page(driver, timeout: int = 20):
             if btn:
                 return "start", btn
             start_seen_at = None
-        time.sleep(0.5)
+        time.sleep(POLL)
     driver.switch_to.default_content()
     return None, None
 
@@ -234,7 +238,7 @@ def is_completed(driver, url: str, timeout: int = 15) -> bool:
         if _find(driver, [STATUS_XPATH]):
             driver.switch_to.default_content()
             return True
-        time.sleep(0.5)
+        time.sleep(POLL)
     driver.switch_to.default_content()
     return False
 
