@@ -59,7 +59,11 @@ START_XPATHS = [  # priority order; searched in the page and in every (nested) i
 MAX_FRAME_DEPTH = 3
 # Read-only check of the activity page after you confirm. Adjust to SumTotal's actual status text.
 COMPLETED_XPATH = "//*[not(self::script)][translate(normalize-space(text()), 'COMPLETED', 'completed') = 'completed']"
-DONE_STATUSES = {"done", "done-unverified"}
+# SumTotal puts the activity status in an inline <script> (page-state JSON), e.g. ..."Attended"...
+# Matched only as a quoted value after a colon, so keys like "isAttended": false or text like
+# "Unattended" don't count. Tighten this once the real snippet is known.
+STATUS_PATTERN = re.compile(r"""[:=]\s*["'](attended|completed)["']""", re.IGNORECASE)
+DONE_STATUSES = {"done", "done-unverified", "already-attended"}
 
 
 @dataclass
@@ -200,9 +204,20 @@ def dump_debug(driver, item: Item) -> None:
     driver.switch_to.default_content()
 
 
+def status_match(driver) -> str | None:
+    """Return a snippet around an Attended/Completed status in the page's scripts, or None."""
+    src = driver.page_source
+    m = STATUS_PATTERN.search(src)
+    if not m:
+        return None
+    return " ".join(src[max(0, m.start() - 60):m.end() + 20].split())
+
+
 def is_completed(driver, url: str, timeout: int = 10) -> bool:
-    """Reload the activity page and look for a Completed status. Read-only."""
+    """Reload the activity page and look for an Attended/Completed status. Read-only."""
     driver.get(url)
+    if status_match(driver):
+        return True
     try:
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.XPATH, COMPLETED_XPATH)))
@@ -279,6 +294,11 @@ def main(docx_path: Path) -> None:
         for n, item in enumerate(queue, 1):
             driver.get(item.url)
             print(f"[{n}/{len(queue)}] due {item.due:%d %b} | {item.title}")
+            snippet = status_match(driver)
+            if snippet:
+                print(f"  Already attended/completed - skipping. Matched: ...{snippet}...")
+                log(item, "already-attended")
+                continue
             if not open_document(driver, item):
                 print("  Start button not found (course/ILT or already started?) - handle manually.")
             ans = input("  Answer the read confirmation in the browser, then Enter = done | s = skip | q = quit: ").strip().lower()
